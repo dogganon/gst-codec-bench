@@ -100,14 +100,18 @@ static std::string make_pipeline(const Options& o) {
         : "video/x-raw,format=I420";
     return "appsrc name=input format=time is-live=false block=true caps=\"" + caps +
         "\" ! queue ! " + o.converter + " ! " + encoded_input +
-        " ! " + o.encoder + " ! " + o.parser +
-        " name=bitstream ! " + o.decoder + " ! " + o.converter +
+        " ! " + o.encoder + " name=encoder ! queue ! " + o.parser +
+        " name=bitstream ! " + o.decoder + " name=decoder ! queue ! " + o.converter +
         " ! " + caps + " ! appsink name=output sync=false";
 }
 
 struct Metrics {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> input_buffers{0};
+    std::atomic<std::uint64_t> encoder_input{0};
+    std::atomic<std::uint64_t> encoder_output{0};
+    std::atomic<std::uint64_t> decoder_input{0};
+    std::atomic<bool> eos_sent{false};
     std::atomic<std::uint64_t> decoded{0};
     std::atomic<std::uint64_t> encoded_bytes{0};
     std::atomic<std::uint64_t> encoded_buffers{0};
@@ -118,6 +122,21 @@ static GstPadProbeReturn count_input(GstPad*, GstPadProbeInfo* info, gpointer da
         ++static_cast<Metrics*>(data)->input_buffers;
     }
     return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn count_buffer(GstPad*, GstPadProbeInfo* info, gpointer data) {
+    if (GST_PAD_PROBE_INFO_BUFFER(info)) {
+        ++*static_cast<std::atomic<std::uint64_t>*>(data);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+static void probe_pad(GstElement* element, const char* name,
+                      std::atomic<std::uint64_t>& counter) {
+    GstPad* pad = gst_element_get_static_pad(element, name);
+    if (!pad) throw std::runtime_error(std::string("missing pad ") + name);
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, count_buffer, &counter, nullptr);
+    gst_object_unref(pad);
 }
 
 static GstPadProbeReturn count_encoded(GstPad*, GstPadProbeInfo* info, gpointer data) {
@@ -161,8 +180,10 @@ static void run(const Options& o) {
     GstElement* input = gst_bin_get_by_name(GST_BIN(pipeline), "input");
     GstElement* output = gst_bin_get_by_name(GST_BIN(pipeline), "output");
     GstElement* parser = gst_bin_get_by_name(GST_BIN(pipeline), "bitstream");
+    GstElement* encoder = gst_bin_get_by_name(GST_BIN(pipeline), "encoder");
+    GstElement* decoder = gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
     GstBus* bus = gst_element_get_bus(pipeline);
-    if (!input || !output || !parser || !bus) {
+    if (!input || !output || !parser || !encoder || !decoder || !bus) {
         throw std::runtime_error("required pipeline element missing");
     }
 
@@ -170,6 +191,9 @@ static void run(const Options& o) {
     GstPad* input_pad = gst_element_get_static_pad(input, "src");
     gst_pad_add_probe(input_pad, GST_PAD_PROBE_TYPE_BUFFER, count_input, &metrics, nullptr);
     gst_object_unref(input_pad);
+    probe_pad(encoder, "sink", metrics.encoder_input);
+    probe_pad(encoder, "src", metrics.encoder_output);
+    probe_pad(decoder, "sink", metrics.decoder_input);
     GstPad* pad = gst_element_get_static_pad(parser, "src");
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, count_encoded, &metrics, nullptr);
     gst_object_unref(pad);
@@ -201,6 +225,8 @@ static void run(const Options& o) {
         if (!failed) {
             if (gst_app_src_end_of_stream(GST_APP_SRC(input)) != GST_FLOW_OK) {
                 failed = true;
+            } else {
+                metrics.eos_sent = true;
             }
         }
     });
@@ -223,7 +249,9 @@ static void run(const Options& o) {
         if (gst_app_sink_is_eos(GST_APP_SINK(output))) break;
         const auto now = std::chrono::steady_clock::now();
         const auto total = metrics.submitted.load() + metrics.input_buffers.load() +
-                           metrics.encoded_buffers.load() + metrics.decoded.load();
+                           metrics.encoder_input.load() + metrics.encoder_output.load() +
+                           metrics.encoded_buffers.load() + metrics.decoder_input.load() +
+                           metrics.decoded.load();
         if (total != last_total) {
             last_progress = now;
             last_total = total;
@@ -232,7 +260,11 @@ static void run(const Options& o) {
             const double seconds = std::chrono::duration<double>(now - start).count();
             std::cerr << "[" << seconds << "s] submitted=" << metrics.submitted.load()
                       << " input=" << metrics.input_buffers.load()
-                      << " encoded=" << metrics.encoded_buffers.load()
+                      << " enc_in=" << metrics.encoder_input.load()
+                      << " enc_out=" << metrics.encoder_output.load()
+                      << " parsed=" << metrics.encoded_buffers.load()
+                      << " dec_in=" << metrics.decoder_input.load()
+                      << " eos_sent=" << metrics.eos_sent.load()
                       << " decoded=" << decoded << "/" << o.frames
                       << " throughput=" << decoded / seconds << " fps\n";
             last_report = now;
@@ -267,6 +299,8 @@ static void run(const Options& o) {
 
     gst_object_unref(bus);
     gst_object_unref(parser);
+    gst_object_unref(encoder);
+    gst_object_unref(decoder);
     gst_object_unref(output);
     gst_object_unref(input);
     gst_object_unref(pipeline);
