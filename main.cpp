@@ -91,18 +91,26 @@ static Options parse_options(int argc, char** argv) {
     return opts;
 }
 
-static std::string make_pipeline(const Options& o) {
-    const std::string caps = "video/x-raw,format=I420,width=" +
-        std::to_string(o.width) + ",height=" + std::to_string(o.height) +
-        ",framerate=" + std::to_string(o.fps) + "/1";
-    const std::string encoded_input = o.nvmm
+static std::string raw_caps(const Options& o) {
+    return "video/x-raw,format=I420,width=" + std::to_string(o.width) +
+           ",height=" + std::to_string(o.height) +
+           ",framerate=" + std::to_string(o.fps) + "/1";
+}
+
+static std::string encoder_pipeline(const Options& o) {
+    const std::string input_caps = o.nvmm
         ? "video/x-raw(memory:NVMM),format=I420"
         : "video/x-raw,format=I420";
-    return "appsrc name=input format=time is-live=false block=true caps=\"" + caps +
-        "\" ! queue ! " + o.converter + " ! " + encoded_input +
-        " ! " + o.encoder + " name=encoder ! queue ! " + o.parser +
-        " name=bitstream ! " + o.decoder + " name=decoder ! queue ! " + o.converter +
-        " ! " + caps + " ! appsink name=output sync=false";
+    return "appsrc name=input format=time block=true caps=\"" + raw_caps(o) +
+           "\" ! queue ! " + o.converter + " ! " + input_caps +
+           " ! " + o.encoder + " name=encoder ! queue ! " + o.parser +
+           " name=bitstream ! appsink name=encoded sync=false";
+}
+
+static std::string decoder_pipeline(const Options& o) {
+    return "appsrc name=compressed format=time block=true ! queue ! " +
+           o.decoder + " name=decoder ! queue ! " + o.converter +
+           " ! " + raw_caps(o) + " ! appsink name=output sync=false";
 }
 
 struct Metrics {
@@ -116,13 +124,6 @@ struct Metrics {
     std::atomic<std::uint64_t> encoded_bytes{0};
     std::atomic<std::uint64_t> encoded_buffers{0};
 };
-
-static GstPadProbeReturn count_input(GstPad*, GstPadProbeInfo* info, gpointer data) {
-    if (GST_PAD_PROBE_INFO_BUFFER(info)) {
-        ++static_cast<Metrics*>(data)->input_buffers;
-    }
-    return GST_PAD_PROBE_OK;
-}
 
 static GstPadProbeReturn count_buffer(GstPad*, GstPadProbeInfo* info, gpointer data) {
     if (GST_PAD_PROBE_INFO_BUFFER(info)) {
@@ -164,10 +165,8 @@ static std::string bus_error(GstBus* bus) {
     return result;
 }
 
-static void run(const Options& o) {
+static GstElement* create_pipeline(const std::string& description) {
     GError* error = nullptr;
-    const std::string description = make_pipeline(o);
-    std::cout << "Pipeline: " << description << "\n";
     GstElement* pipeline = gst_parse_launch(description.c_str(), &error);
     if (error) {
         const std::string message = error->message;
@@ -176,40 +175,55 @@ static void run(const Options& o) {
         throw std::runtime_error("pipeline creation: " + message);
     }
     if (!pipeline) throw std::runtime_error("pipeline creation failed");
+    return pipeline;
+}
 
-    GstElement* input = gst_bin_get_by_name(GST_BIN(pipeline), "input");
-    GstElement* output = gst_bin_get_by_name(GST_BIN(pipeline), "output");
-    GstElement* parser = gst_bin_get_by_name(GST_BIN(pipeline), "bitstream");
-    GstElement* encoder = gst_bin_get_by_name(GST_BIN(pipeline), "encoder");
-    GstElement* decoder = gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
-    GstBus* bus = gst_element_get_bus(pipeline);
-    if (!input || !output || !parser || !encoder || !decoder || !bus) {
+static void run(const Options& o) {
+    const std::string enc_description = encoder_pipeline(o);
+    const std::string dec_description = decoder_pipeline(o);
+    std::cout << "Encoder pipeline: " << enc_description << "\n"
+              << "Decoder pipeline: " << dec_description << std::endl;
+
+    GstElement* enc = create_pipeline(enc_description);
+    GstElement* dec = create_pipeline(dec_description);
+    GstElement* input = gst_bin_get_by_name(GST_BIN(enc), "input");
+    GstElement* encoded = gst_bin_get_by_name(GST_BIN(enc), "encoded");
+    GstElement* parser = gst_bin_get_by_name(GST_BIN(enc), "bitstream");
+    GstElement* encoder = gst_bin_get_by_name(GST_BIN(enc), "encoder");
+    GstElement* compressed = gst_bin_get_by_name(GST_BIN(dec), "compressed");
+    GstElement* output = gst_bin_get_by_name(GST_BIN(dec), "output");
+    GstElement* decoder = gst_bin_get_by_name(GST_BIN(dec), "decoder");
+    GstBus* enc_bus = gst_element_get_bus(enc);
+    GstBus* dec_bus = gst_element_get_bus(dec);
+    if (!input || !encoded || !parser || !encoder || !compressed ||
+        !output || !decoder || !enc_bus || !dec_bus) {
         throw std::runtime_error("required pipeline element missing");
     }
 
     Metrics metrics;
-    GstPad* input_pad = gst_element_get_static_pad(input, "src");
-    gst_pad_add_probe(input_pad, GST_PAD_PROBE_TYPE_BUFFER, count_input, &metrics, nullptr);
-    gst_object_unref(input_pad);
+    probe_pad(input, "src", metrics.input_buffers);
     probe_pad(encoder, "sink", metrics.encoder_input);
     probe_pad(encoder, "src", metrics.encoder_output);
     probe_pad(decoder, "sink", metrics.decoder_input);
-    GstPad* pad = gst_element_get_static_pad(parser, "src");
-    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, count_encoded, &metrics, nullptr);
-    gst_object_unref(pad);
+    GstPad* parser_pad = gst_element_get_static_pad(parser, "src");
+    gst_pad_add_probe(parser_pad, GST_PAD_PROBE_TYPE_BUFFER, count_encoded, &metrics, nullptr);
+    gst_object_unref(parser_pad);
 
-    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-        throw std::runtime_error("failed to start pipeline: " + bus_error(bus));
+    if (gst_element_set_state(dec, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE ||
+        gst_element_set_state(enc, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        throw std::runtime_error("failed to start GStreamer pipelines");
     }
 
-    std::atomic<bool> failed{false};
+    std::atomic<bool> stop{false};
+    std::atomic<bool> producer_failed{false};
+    std::atomic<bool> bridge_failed{false};
+    std::atomic<std::uint64_t> bridged{0};
     const auto start = std::chrono::steady_clock::now();
+
     std::thread producer([&] {
-        const std::size_t frame_size =
-            static_cast<std::size_t>(o.width) * o.height * 3 / 2;
+        const std::size_t frame_size = static_cast<std::size_t>(o.width) * o.height * 3 / 2;
         std::vector<std::uint8_t> frame(frame_size, 128);
-        for (int i = 0; i < o.frames && !failed; ++i) {
-            // Changing luminance prevents trivial identical-frame encoding.
+        for (int i = 0; i < o.frames && !stop; ++i) {
             std::fill_n(frame.begin(), static_cast<std::size_t>(o.width) * o.height,
                         static_cast<std::uint8_t>(16 + (i * 7) % 220));
             GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame_size, nullptr);
@@ -217,16 +231,49 @@ static void run(const Options& o) {
             GST_BUFFER_PTS(buffer) = gst_util_uint64_scale(i, GST_SECOND, o.fps);
             GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, o.fps);
             if (gst_app_src_push_buffer(GST_APP_SRC(input), buffer) != GST_FLOW_OK) {
-                failed = true;
+                if (!stop) producer_failed = true;
                 return;
             }
             ++metrics.submitted;
         }
-        if (!failed) {
-            if (gst_app_src_end_of_stream(GST_APP_SRC(input)) != GST_FLOW_OK) {
-                failed = true;
-            } else {
-                metrics.eos_sent = true;
+        if (!stop && gst_app_src_end_of_stream(GST_APP_SRC(input)) == GST_FLOW_OK) {
+            metrics.eos_sent = true;
+        } else if (!stop) {
+            producer_failed = true;
+        }
+    });
+
+    // Transfer compressed buffers through ordinary system memory. The two
+    // GStreamer pipelines own independent encoder/decoder state and allocation.
+    std::thread bridge([&] {
+        bool have_caps = false;
+        while (!stop) {
+            GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(encoded),
+                                                              200 * GST_MSECOND);
+            if (sample) {
+                GstCaps* caps = gst_sample_get_caps(sample);
+                if (!caps) {
+                    bridge_failed = true;
+                    gst_sample_unref(sample);
+                    break;
+                }
+                if (!have_caps) {
+                    gst_app_src_set_caps(GST_APP_SRC(compressed), caps);
+                    have_caps = true;
+                }
+                // Copy encoded bytes so the decoder does not hold buffers from
+                // the NVIDIA encoder's pool.
+                GstBuffer* copy = gst_buffer_copy_deep(gst_sample_get_buffer(sample));
+                gst_sample_unref(sample);
+                if (!copy || gst_app_src_push_buffer(GST_APP_SRC(compressed), copy) != GST_FLOW_OK) {
+                    if (!stop) bridge_failed = true;
+                    break;
+                }
+                ++bridged;
+            } else if (gst_app_sink_is_eos(GST_APP_SINK(encoded))) {
+                if (gst_app_src_end_of_stream(GST_APP_SRC(compressed)) != GST_FLOW_OK && !stop)
+                    bridge_failed = true;
+                break;
             }
         }
     });
@@ -236,7 +283,7 @@ static void run(const Options& o) {
     auto last_report = start;
     auto last_progress = start;
     std::uint64_t last_total = 0;
-    while (decoded < o.frames && !failed) {
+    while (decoded < o.frames) {
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output),
                                                         200 * GST_MSECOND);
         if (sample) {
@@ -244,14 +291,20 @@ static void run(const Options& o) {
             ++metrics.decoded;
             gst_sample_unref(sample);
         }
-        failure = bus_error(bus);
-        if (!failure.empty()) break;
+        if (producer_failed || bridge_failed) {
+            failure = "producer or compressed-buffer bridge failed";
+            break;
+        }
+        failure = bus_error(enc_bus);
+        if (!failure.empty()) { failure = "encoder: " + failure; break; }
+        failure = bus_error(dec_bus);
+        if (!failure.empty()) { failure = "decoder: " + failure; break; }
         if (gst_app_sink_is_eos(GST_APP_SINK(output))) break;
         const auto now = std::chrono::steady_clock::now();
         const auto total = metrics.submitted.load() + metrics.input_buffers.load() +
                            metrics.encoder_input.load() + metrics.encoder_output.load() +
-                           metrics.encoded_buffers.load() + metrics.decoder_input.load() +
-                           metrics.decoded.load();
+                           metrics.encoded_buffers.load() + bridged.load() +
+                           metrics.decoder_input.load() + metrics.decoded.load();
         if (total != last_total) {
             last_progress = now;
             last_total = total;
@@ -263,6 +316,7 @@ static void run(const Options& o) {
                       << " enc_in=" << metrics.encoder_input.load()
                       << " enc_out=" << metrics.encoder_output.load()
                       << " parsed=" << metrics.encoded_buffers.load()
+                      << " bridged=" << bridged.load()
                       << " dec_in=" << metrics.decoder_input.load()
                       << " eos_sent=" << metrics.eos_sent.load()
                       << " decoded=" << decoded << "/" << o.frames
@@ -270,7 +324,7 @@ static void run(const Options& o) {
             last_report = now;
         }
         if (now - last_progress > std::chrono::seconds(10)) {
-            failure = "pipeline stalled for 10s (inspect submitted/input/encoded/decoded counters)";
+            failure = "pipeline stalled for 10s";
             break;
         }
         if (now - start > std::chrono::seconds(120)) {
@@ -278,17 +332,17 @@ static void run(const Options& o) {
             break;
         }
     }
-    const auto stop = std::chrono::steady_clock::now();
-    // Flush blocked appsrc before joining the producer on any failure.
-    if (decoded != o.frames || failed || !failure.empty()) {
-        failed = true;
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-    }
+    const auto finish = std::chrono::steady_clock::now();
+    stop = true;
+    // Unblock appsrc push operations and pending appsink pulls before joining.
+    gst_element_set_state(enc, GST_STATE_NULL);
+    gst_element_set_state(dec, GST_STATE_NULL);
     producer.join();
-    if (failure.empty()) failure = bus_error(bus);
-    gst_element_set_state(pipeline, GST_STATE_NULL);
+    bridge.join();
+    if (failure.empty()) failure = bus_error(enc_bus);
+    if (failure.empty()) failure = bus_error(dec_bus);
 
-    const double seconds = std::chrono::duration<double>(stop - start).count();
+    const double seconds = std::chrono::duration<double>(finish - start).count();
     std::cout << "Decoded: " << decoded << "/" << o.frames
               << " frames, elapsed: " << seconds << " s, throughput: "
               << decoded / seconds << " fps\n"
@@ -297,18 +351,20 @@ static void run(const Options& o) {
               << (metrics.encoded_bytes.load() * 8.0 / seconds / 1e6)
               << " Mbit/s (wall-clock rate)\n";
 
-    gst_object_unref(bus);
+    gst_object_unref(enc_bus);
+    gst_object_unref(dec_bus);
     gst_object_unref(parser);
     gst_object_unref(encoder);
     gst_object_unref(decoder);
     gst_object_unref(output);
+    gst_object_unref(encoded);
+    gst_object_unref(compressed);
     gst_object_unref(input);
-    gst_object_unref(pipeline);
+    gst_object_unref(enc);
+    gst_object_unref(dec);
 
     if (!failure.empty()) throw std::runtime_error(failure);
-    if (failed || decoded != o.frames) {
-        throw std::runtime_error("encode/decode did not complete all frames");
-    }
+    if (decoded != o.frames) throw std::runtime_error("incomplete encode/decode");
 }
 
 int main(int argc, char** argv) {
