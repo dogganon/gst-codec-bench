@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -20,11 +21,13 @@ struct Options {
     std::string parser = "h264parse";
     std::string converter = "nvvidconv";
     std::string mode = "both";
+    std::string profile;
     std::string input_file;
     bool nvmm = true;
     int width = 640;
     int height = 480;
     int fps = 30;
+    double pace_fps = 0.0;
     int frames = 300;
 };
 
@@ -35,6 +38,7 @@ static void usage(const char* executable) {
         << "  --input PATH      H.264 elementary stream for decode mode\n"
         << "  --encoder NAME    GStreamer encoder (default nvv4l2h264enc)\n"
         << "  --decoder NAME    GStreamer decoder (default nvv4l2decoder)\n"
+        << "  --profile NAME    H.264 baseline, main, or high (encoder modes)\n"
         << "  --parser NAME     GStreamer parser (default h264parse)\n"
         << "  --converter NAME  Raw video converter (default nvvidconv)\n"
         << "  --system-memory   Use ordinary raw-video caps instead of NVMM\n"
@@ -42,6 +46,7 @@ static void usage(const char* executable) {
         << "  --width N         Width, even (default 640)\n"
         << "  --height N        Height, even (default 480)\n"
         << "  --fps N           Frame timestamps per second (default 30)\n"
+        << "  --pace-fps N      Input pacing rate (default 0: unlimited)\n"
         << "  --frames N        Number of frames (default 300)\n"
         << "  --help            Show this message\n";
 }
@@ -53,6 +58,22 @@ static int number(const char* s) {
         throw std::runtime_error("expected a positive integer: " + std::string(s));
     }
     return value;
+}
+
+static double parse_pace_fps(const std::string& value) {
+    std::size_t consumed = 0;
+    const double result = std::stod(value, &consumed);
+    if (consumed != value.size() || !std::isfinite(result) || result < 0.0)
+        throw std::runtime_error("--pace-fps must be a nonnegative finite number");
+    return result;
+}
+
+static void pace_input(double fps, std::chrono::steady_clock::time_point start, int index) {
+    if (fps > 0.0) {
+        const auto delay = std::chrono::duration<double>(static_cast<double>(index) / fps);
+        std::this_thread::sleep_until(start +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay));
+    }
 }
 
 static Options parse_options(int argc, char** argv) {
@@ -82,12 +103,14 @@ static Options parse_options(int argc, char** argv) {
         if (arg == "--mode") opts.mode = value;
         else if (arg == "--input") opts.input_file = value;
         else if (arg == "--encoder") opts.encoder = value;
+        else if (arg == "--profile") opts.profile = value;
         else if (arg == "--decoder") opts.decoder = value;
         else if (arg == "--parser") opts.parser = value;
         else if (arg == "--converter") opts.converter = value;
         else if (arg == "--width") opts.width = number(argv[i]);
         else if (arg == "--height") opts.height = number(argv[i]);
         else if (arg == "--fps") opts.fps = number(argv[i]);
+        else if (arg == "--pace-fps") opts.pace_fps = parse_pace_fps(value);
         else if (arg == "--frames") opts.frames = number(argv[i]);
         else throw std::runtime_error("unknown option: " + arg);
     }
@@ -96,6 +119,13 @@ static Options parse_options(int argc, char** argv) {
     }
     if (opts.mode != "both" && opts.mode != "encode" && opts.mode != "decode")
         throw std::runtime_error("--mode must be both, encode or decode");
+    if (!opts.profile.empty() && opts.profile != "baseline" &&
+        opts.profile != "main" && opts.profile != "high")
+        throw std::runtime_error("--profile must be baseline, main, or high");
+    if (opts.mode == "decode" && !opts.profile.empty())
+        throw std::runtime_error("--profile only applies to encoding");
+    if (opts.mode == "decode" && opts.pace_fps > 0.0)
+        throw std::runtime_error("--pace-fps is only supported for encode and both modes");
     if (opts.mode == "decode" && opts.input_file.empty())
         throw std::runtime_error("--mode decode requires --input PATH");
     return opts;
@@ -114,7 +144,10 @@ static std::string encoder_pipeline(const Options& o) {
     return "appsrc name=input format=time block=true caps=\"" + raw_caps(o) +
            "\" ! queue ! " + o.converter + " ! " + input_caps +
            " ! " + o.encoder + " name=encoder ! queue ! " + o.parser +
-           " name=bitstream ! appsink name=encoded sync=false";
+           " name=bitstream" +
+           (o.profile.empty() || o.encoder == "nvv4l2h264enc" ? "" :
+            " ! video/x-h264,profile=" + o.profile) +
+           " ! appsink name=encoded sync=false";
 }
 
 static std::string decoder_pipeline(const Options& o) {
@@ -189,12 +222,37 @@ static GstElement* create_pipeline(const std::string& description) {
 }
 
 // Encode-only mode does not instantiate a decoder at all.
+static void set_encoder_profile(GstElement* encoder, const Options& o) {
+    if (o.profile.empty() || o.encoder != "nvv4l2h264enc") return;
+    GParamSpec* spec = g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "profile");
+    if (!spec || !G_IS_PARAM_SPEC_ENUM(spec))
+        throw std::runtime_error("NVENC does not expose an enum profile property");
+    GEnumClass* values = G_ENUM_CLASS(g_type_class_ref(G_PARAM_SPEC_VALUE_TYPE(spec)));
+    bool matched = false;
+    for (guint i = 0; i < values->n_values; ++i) {
+        const GEnumValue& value = values->values[i];
+        const std::string nick = value.value_nick ? value.value_nick : "";
+        const std::string name = value.value_name ? value.value_name : "";
+        if (g_ascii_strcasecmp(nick.c_str(), o.profile.c_str()) == 0 ||
+            g_ascii_strcasecmp(name.c_str(), o.profile.c_str()) == 0) {
+            g_object_set(encoder, "profile", value.value, nullptr);
+            matched = true;
+            break;
+        }
+    }
+    g_type_class_unref(values);
+    if (!matched)
+        throw std::runtime_error("unsupported NVENC H.264 profile: " + o.profile);
+}
+
 static void run_encode_only(const Options& o) {
     GstElement* pipeline = create_pipeline(encoder_pipeline(o));
     GstElement* input = gst_bin_get_by_name(GST_BIN(pipeline), "input");
     GstElement* output = gst_bin_get_by_name(GST_BIN(pipeline), "encoded");
     GstBus* bus = gst_element_get_bus(pipeline);
     if (!input || !output || !bus) throw std::runtime_error("missing encoder elements");
+    GstElement* encoder = gst_bin_get_by_name(GST_BIN(pipeline), "encoder");
+    set_encoder_profile(encoder, o);
 
     if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
         throw std::runtime_error("could not start encoder");
@@ -206,6 +264,8 @@ static void run_encode_only(const Options& o) {
         const std::size_t size = static_cast<std::size_t>(o.width) * o.height * 3 / 2;
         std::vector<std::uint8_t> frame(size, 128);
         for (int i = 0; i < o.frames && !stop; ++i) {
+            pace_input(o.pace_fps, start, i);
+            if (stop) break;
             std::fill_n(frame.begin(), static_cast<std::size_t>(o.width) * o.height,
                         static_cast<std::uint8_t>(16 + (i * 7) % 220));
             GstBuffer* b = gst_buffer_new_allocate(nullptr, size, nullptr);
@@ -227,6 +287,7 @@ static void run_encode_only(const Options& o) {
     std::string error;
     auto last_progress = start;
     auto last_report = start;
+    int last_report_frames = 0;
     while (received < o.frames) {
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output),
                                                          200 * GST_MSECOND);
@@ -240,8 +301,11 @@ static void run_encode_only(const Options& o) {
         if (!error.empty() || failed || gst_app_sink_is_eos(GST_APP_SINK(output))) break;
         const auto now = std::chrono::steady_clock::now();
         if (now - last_report >= std::chrono::seconds(1)) {
+            const double interval = std::chrono::duration<double>(now - last_report).count();
             std::cerr << "submitted=" << submitted << " encoded=" << received
-                      << "/" << o.frames << "\n";
+                      << "/" << o.frames << " throughput="
+                      << (received - last_report_frames) / interval << " fps\n";
+            last_report_frames = received;
             last_report = now;
         }
         if (now - last_progress > std::chrono::seconds(10)) {
@@ -260,6 +324,7 @@ static void run_encode_only(const Options& o) {
     gst_object_unref(bus);
     gst_object_unref(input);
     gst_object_unref(output);
+    gst_object_unref(encoder);
     gst_object_unref(pipeline);
     if (!error.empty()) throw std::runtime_error(error);
     if (failed || received != o.frames) throw std::runtime_error("encode incomplete");
@@ -283,6 +348,7 @@ static void run_decode_only(const Options& o) {
     auto last_progress = start;
     auto last_report = start;
     int decoded = 0;
+    int last_report_frames = 0;
     std::string error;
     while (decoded < o.frames) {
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output),
@@ -296,7 +362,11 @@ static void run_decode_only(const Options& o) {
         if (!error.empty() || gst_app_sink_is_eos(GST_APP_SINK(output))) break;
         const auto now = std::chrono::steady_clock::now();
         if (now - last_report >= std::chrono::seconds(1)) {
-            std::cerr << "decoded=" << decoded << "/" << o.frames << "\n";
+            const double interval = std::chrono::duration<double>(now - last_report).count();
+            std::cerr << "decoded=" << decoded << "/" << o.frames
+                      << " throughput=" << (decoded - last_report_frames) / interval
+                      << " fps\n";
+            last_report_frames = decoded;
             last_report = now;
         }
         if (now - last_progress > std::chrono::seconds(10)) {
@@ -340,6 +410,7 @@ static void run(const Options& o) {
         throw std::runtime_error("required pipeline element missing");
     }
 
+    set_encoder_profile(encoder, o);
     Metrics metrics;
     probe_pad(input, "src", metrics.input_buffers);
     probe_pad(encoder, "sink", metrics.encoder_input);
@@ -364,6 +435,8 @@ static void run(const Options& o) {
         const std::size_t frame_size = static_cast<std::size_t>(o.width) * o.height * 3 / 2;
         std::vector<std::uint8_t> frame(frame_size, 128);
         for (int i = 0; i < o.frames && !stop; ++i) {
+            pace_input(o.pace_fps, start, i);
+            if (stop) break;
             std::fill_n(frame.begin(), static_cast<std::size_t>(o.width) * o.height,
                         static_cast<std::uint8_t>(16 + (i * 7) % 220));
             GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame_size, nullptr);

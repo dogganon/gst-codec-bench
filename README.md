@@ -4,8 +4,10 @@ Standalone C++17 throughput test for the system GStreamer installation. It uses
 **two independent pipelines**: raw appsrc → encoder → parser → encoded appsink,
 and compressed appsrc → decoder → decoded appsink. A bridge thread copies
 compressed buffers and forwards their negotiated caps and timestamps. Frames
-are pushed as fast as possible (not paced in real time). Throughput includes
-memory conversions and buffer transfer, not just codec latency.
+are pushed as fast as possible by default. Use `--pace-fps` to simulate a
+camera's real-time frame delivery rate; `--fps` controls video timestamps and
+caps independently. Throughput includes memory conversions and buffer transfer,
+not just codec latency.
 
 For reproducible local x86-64 builds, install Pixi and run:
 
@@ -19,7 +21,6 @@ requires accessible NVIDIA CUDA/video driver libraries and GPU devices. On
 this host the plugin reports `Unable to initialize CUDA library`, so NVENC
 and NVDEC cannot be tested here. Use the system Jetson plugins on the G1.
 
-including memory conversions and buffering, not isolated codec latency.
 
 Run either hardware codec independently on the G1:
 
@@ -33,6 +34,26 @@ instantiate an encoder. Use `--width`, `--height`, and `--fps` to match the
 input stream. `--frames` sets the maximum number of decoded frames; if the
 file ends earlier, the actual number is reported. The default `--mode both`
 keeps the two-pipeline round-trip benchmark.
+
+To simulate a 30 FPS camera in encode-only or round-trip mode:
+
+```sh
+./build/gst_codec_bench --mode encode --pace-fps 30 --fps 30 --frames 300
+```
+
+Select the H.264 encoding profile with `--profile baseline|main|high`:
+
+```sh
+./build/gst_codec_bench --mode encode --profile main --pace-fps 30
+```
+
+With Jetson `nvv4l2h264enc`, this sets the encoder's `profile` property.
+With `x264enc`, profile selection uses H.264 output caps negotiation.
+The default leaves the encoder's profile selection unchanged; decode-only
+mode does not accept `--profile`.
+
+`--pace-fps 0` (default) disables pacing. Decode-only mode reads the file
+as fast as possible and does not accept a positive `--pace-fps`.
 
 
 On the Unitree G1 Jetson Orin (JetPack GStreamer plugins):
