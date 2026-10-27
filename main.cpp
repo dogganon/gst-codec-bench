@@ -19,6 +19,8 @@ struct Options {
     std::string decoder = "nvv4l2decoder";
     std::string parser = "h264parse";
     std::string converter = "nvvidconv";
+    std::string mode = "both";
+    std::string input_file;
     bool nvmm = true;
     int width = 640;
     int height = 480;
@@ -29,6 +31,8 @@ struct Options {
 static void usage(const char* executable) {
     std::cout
         << "Usage: " << executable << " [options]\n"
+        << "  --mode MODE       both (default), encode, or decode\n"
+        << "  --input PATH      H.264 elementary stream for decode mode\n"
         << "  --encoder NAME    GStreamer encoder (default nvv4l2h264enc)\n"
         << "  --decoder NAME    GStreamer decoder (default nvv4l2decoder)\n"
         << "  --parser NAME     GStreamer parser (default h264parse)\n"
@@ -75,7 +79,9 @@ static Options parse_options(int argc, char** argv) {
             throw std::runtime_error("missing value for " + arg);
         }
         const std::string value = argv[i];
-        if (arg == "--encoder") opts.encoder = value;
+        if (arg == "--mode") opts.mode = value;
+        else if (arg == "--input") opts.input_file = value;
+        else if (arg == "--encoder") opts.encoder = value;
         else if (arg == "--decoder") opts.decoder = value;
         else if (arg == "--parser") opts.parser = value;
         else if (arg == "--converter") opts.converter = value;
@@ -88,6 +94,10 @@ static Options parse_options(int argc, char** argv) {
     if (opts.width % 2 || opts.height % 2) {
         throw std::runtime_error("I420 requires even width and height");
     }
+    if (opts.mode != "both" && opts.mode != "encode" && opts.mode != "decode")
+        throw std::runtime_error("--mode must be both, encode or decode");
+    if (opts.mode == "decode" && opts.input_file.empty())
+        throw std::runtime_error("--mode decode requires --input PATH");
     return opts;
 }
 
@@ -176,6 +186,136 @@ static GstElement* create_pipeline(const std::string& description) {
     }
     if (!pipeline) throw std::runtime_error("pipeline creation failed");
     return pipeline;
+}
+
+// Encode-only mode does not instantiate a decoder at all.
+static void run_encode_only(const Options& o) {
+    GstElement* pipeline = create_pipeline(encoder_pipeline(o));
+    GstElement* input = gst_bin_get_by_name(GST_BIN(pipeline), "input");
+    GstElement* output = gst_bin_get_by_name(GST_BIN(pipeline), "encoded");
+    GstBus* bus = gst_element_get_bus(pipeline);
+    if (!input || !output || !bus) throw std::runtime_error("missing encoder elements");
+
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
+        throw std::runtime_error("could not start encoder");
+    std::atomic<bool> stop{false};
+    std::atomic<bool> failed{false};
+    std::atomic<int> submitted{0};
+    const auto start = std::chrono::steady_clock::now();
+    std::thread producer([&] {
+        const std::size_t size = static_cast<std::size_t>(o.width) * o.height * 3 / 2;
+        std::vector<std::uint8_t> frame(size, 128);
+        for (int i = 0; i < o.frames && !stop; ++i) {
+            std::fill_n(frame.begin(), static_cast<std::size_t>(o.width) * o.height,
+                        static_cast<std::uint8_t>(16 + (i * 7) % 220));
+            GstBuffer* b = gst_buffer_new_allocate(nullptr, size, nullptr);
+            gst_buffer_fill(b, 0, frame.data(), size);
+            GST_BUFFER_PTS(b) = gst_util_uint64_scale(i, GST_SECOND, o.fps);
+            GST_BUFFER_DURATION(b) = gst_util_uint64_scale(1, GST_SECOND, o.fps);
+            if (gst_app_src_push_buffer(GST_APP_SRC(input), b) != GST_FLOW_OK) {
+                if (!stop) failed = true;
+                return;
+            }
+            ++submitted;
+        }
+        if (!stop && gst_app_src_end_of_stream(GST_APP_SRC(input)) != GST_FLOW_OK)
+            failed = true;
+    });
+
+    int received = 0;
+    std::uint64_t bytes = 0;
+    std::string error;
+    auto last_progress = start;
+    auto last_report = start;
+    while (received < o.frames) {
+        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output),
+                                                         200 * GST_MSECOND);
+        if (sample) {
+            ++received;
+            bytes += gst_buffer_get_size(gst_sample_get_buffer(sample));
+            gst_sample_unref(sample);
+            last_progress = std::chrono::steady_clock::now();
+        }
+        error = bus_error(bus);
+        if (!error.empty() || failed || gst_app_sink_is_eos(GST_APP_SINK(output))) break;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_report >= std::chrono::seconds(1)) {
+            std::cerr << "submitted=" << submitted << " encoded=" << received
+                      << "/" << o.frames << "\n";
+            last_report = now;
+        }
+        if (now - last_progress > std::chrono::seconds(10)) {
+            error = "encoder stalled for 10s";
+            break;
+        }
+    }
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    stop = true;
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    producer.join();
+    if (error.empty()) error = bus_error(bus);
+    std::cout << "Encoded: " << received << "/" << o.frames << " frames, "
+              << bytes << " bytes, " << received / elapsed << " fps\n";
+    gst_object_unref(bus);
+    gst_object_unref(input);
+    gst_object_unref(output);
+    gst_object_unref(pipeline);
+    if (!error.empty()) throw std::runtime_error(error);
+    if (failed || received != o.frames) throw std::runtime_error("encode incomplete");
+}
+
+// Decode-only mode uses an existing raw H.264 Annex B file, without NVENC.
+static void run_decode_only(const Options& o) {
+    const std::string description =
+        "filesrc name=source ! " + o.parser + " ! " + o.decoder +
+        " name=decoder ! queue ! " + o.converter + " ! " + raw_caps(o) +
+        " ! appsink name=output sync=false";
+    GstElement* pipeline = create_pipeline(description);
+    GstElement* source = gst_bin_get_by_name(GST_BIN(pipeline), "source");
+    GstElement* output = gst_bin_get_by_name(GST_BIN(pipeline), "output");
+    GstBus* bus = gst_element_get_bus(pipeline);
+    if (!source || !output || !bus) throw std::runtime_error("missing decoder elements");
+    g_object_set(source, "location", o.input_file.c_str(), nullptr);
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
+        throw std::runtime_error("could not start decoder");
+    const auto start = std::chrono::steady_clock::now();
+    auto last_progress = start;
+    auto last_report = start;
+    int decoded = 0;
+    std::string error;
+    while (decoded < o.frames) {
+        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output),
+                                                         200 * GST_MSECOND);
+        if (sample) {
+            ++decoded;
+            gst_sample_unref(sample);
+            last_progress = std::chrono::steady_clock::now();
+        }
+        error = bus_error(bus);
+        if (!error.empty() || gst_app_sink_is_eos(GST_APP_SINK(output))) break;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_report >= std::chrono::seconds(1)) {
+            std::cerr << "decoded=" << decoded << "/" << o.frames << "\n";
+            last_report = now;
+        }
+        if (now - last_progress > std::chrono::seconds(10)) {
+            error = "decoder stalled for 10s";
+            break;
+        }
+    }
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    if (error.empty()) error = bus_error(bus);
+    std::cout << "Decoded: " << decoded << " frames in " << elapsed
+              << " s, " << decoded / elapsed << " fps\n";
+    gst_object_unref(bus);
+    gst_object_unref(source);
+    gst_object_unref(output);
+    gst_object_unref(pipeline);
+    if (!error.empty()) throw std::runtime_error(error);
+    if (!decoded) throw std::runtime_error("no decoded frames");
 }
 
 static void run(const Options& o) {
@@ -370,7 +510,10 @@ static void run(const Options& o) {
 int main(int argc, char** argv) {
     gst_init(&argc, &argv);
     try {
-        run(parse_options(argc, argv));
+        const Options opts = parse_options(argc, argv);
+        if (opts.mode == "encode") run_encode_only(opts);
+        else if (opts.mode == "decode") run_decode_only(opts);
+        else run(opts);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

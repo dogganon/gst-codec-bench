@@ -21,6 +21,20 @@ and NVDEC cannot be tested here. Use the system Jetson plugins on the G1.
 
 including memory conversions and buffering, not isolated codec latency.
 
+Run either hardware codec independently on the G1:
+
+```sh
+./build/gst_codec_bench --mode encode --frames 300
+./build/gst_codec_bench --mode decode --input sample.h264 --frames 300
+```
+
+Decode-only takes an existing Annex B H.264 elementary stream; it does not
+instantiate an encoder. Use `--width`, `--height`, and `--fps` to match the
+input stream. `--frames` sets the maximum number of decoded frames; if the
+file ends earlier, the actual number is reported. The default `--mode both`
+keeps the two-pipeline round-trip benchmark.
+
+
 On the Unitree G1 Jetson Orin (JetPack GStreamer plugins):
 
 ```sh
