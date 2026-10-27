@@ -106,9 +106,19 @@ static std::string make_pipeline(const Options& o) {
 }
 
 struct Metrics {
+    std::atomic<std::uint64_t> submitted{0};
+    std::atomic<std::uint64_t> input_buffers{0};
+    std::atomic<std::uint64_t> decoded{0};
     std::atomic<std::uint64_t> encoded_bytes{0};
     std::atomic<std::uint64_t> encoded_buffers{0};
 };
+
+static GstPadProbeReturn count_input(GstPad*, GstPadProbeInfo* info, gpointer data) {
+    if (GST_PAD_PROBE_INFO_BUFFER(info)) {
+        ++static_cast<Metrics*>(data)->input_buffers;
+    }
+    return GST_PAD_PROBE_OK;
+}
 
 static GstPadProbeReturn count_encoded(GstPad*, GstPadProbeInfo* info, gpointer data) {
     auto* metrics = static_cast<Metrics*>(data);
@@ -157,6 +167,9 @@ static void run(const Options& o) {
     }
 
     Metrics metrics;
+    GstPad* input_pad = gst_element_get_static_pad(input, "src");
+    gst_pad_add_probe(input_pad, GST_PAD_PROBE_TYPE_BUFFER, count_input, &metrics, nullptr);
+    gst_object_unref(input_pad);
     GstPad* pad = gst_element_get_static_pad(parser, "src");
     gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, count_encoded, &metrics, nullptr);
     gst_object_unref(pad);
@@ -183,6 +196,7 @@ static void run(const Options& o) {
                 failed = true;
                 return;
             }
+            ++metrics.submitted;
         }
         if (!failed) {
             if (gst_app_src_end_of_stream(GST_APP_SRC(input)) != GST_FLOW_OK) {
@@ -193,19 +207,42 @@ static void run(const Options& o) {
 
     int decoded = 0;
     std::string failure;
+    auto last_report = start;
+    auto last_progress = start;
+    std::uint64_t last_total = 0;
     while (decoded < o.frames && !failed) {
         GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output),
                                                         200 * GST_MSECOND);
         if (sample) {
             ++decoded;
+            ++metrics.decoded;
             gst_sample_unref(sample);
-            continue;
         }
         failure = bus_error(bus);
         if (!failure.empty()) break;
         if (gst_app_sink_is_eos(GST_APP_SINK(output))) break;
-        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(60)) {
-            failure = "timed out waiting for decoded frames";
+        const auto now = std::chrono::steady_clock::now();
+        const auto total = metrics.submitted.load() + metrics.input_buffers.load() +
+                           metrics.encoded_buffers.load() + metrics.decoded.load();
+        if (total != last_total) {
+            last_progress = now;
+            last_total = total;
+        }
+        if (now - last_report >= std::chrono::seconds(1)) {
+            const double seconds = std::chrono::duration<double>(now - start).count();
+            std::cerr << "[" << seconds << "s] submitted=" << metrics.submitted.load()
+                      << " input=" << metrics.input_buffers.load()
+                      << " encoded=" << metrics.encoded_buffers.load()
+                      << " decoded=" << decoded << "/" << o.frames
+                      << " throughput=" << decoded / seconds << " fps\n";
+            last_report = now;
+        }
+        if (now - last_progress > std::chrono::seconds(10)) {
+            failure = "pipeline stalled for 10s (inspect submitted/input/encoded/decoded counters)";
+            break;
+        }
+        if (now - start > std::chrono::seconds(120)) {
+            failure = "pipeline timed out after 120s";
             break;
         }
     }
